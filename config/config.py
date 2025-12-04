@@ -5,7 +5,7 @@ Environment variables are preferred for secrets such as API keys.
 
 import os
 
-VERSION = "2.0"  # Initial public release identifier
+VERSION = "2.1"  # Next public release identifier
 
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY", None)
 WHATCMS_API_KEY = os.getenv("WHATCMS_API_KEY", None)
@@ -22,6 +22,16 @@ WHATCMS_PRIVATE = False        # set to True for paid/private WhatCMS mode
 # File paths (relative to where the script is executed)
 INPUT_CSV = "_input/input.csv"
 OUTPUT_CSV = "_output/output.csv"
+
+# Input windowing for batch runs
+DOMAIN_OFFSET = max(0, int(os.getenv("DOMAIN_OFFSET", 0)))
+
+_domains_per_run_env = os.getenv("DOMAINS_PER_RUN", None)
+if _domains_per_run_env:
+    _domains_per_run = int(_domains_per_run_env)
+    DOMAINS_PER_RUN = _domains_per_run if _domains_per_run > 0 else None
+else:
+    DOMAINS_PER_RUN = None
 
 # Number of concurrent worker threads
 WORKER_COUNT = 4

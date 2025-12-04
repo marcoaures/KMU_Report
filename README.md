@@ -2,7 +2,7 @@
 
 A command-line toolkit that scans websites for availability, performance, security, SEO, accessibility, and legal indicators. It ingests a CSV of domains and produces a consolidated report that highlights technical gaps and compliance risks for small and medium-sized businesses (with a focus on Switzerland).
 
-**Version 2.0:** Public release version
+**Version 2.1:** Public release version
 
 **Disclaimer:** This project includes refactoring and documentation improvements made with the help of AI tools.
 
@@ -14,6 +14,16 @@ A command-line toolkit that scans websites for availability, performance, securi
 - **Performance & responsiveness**: PageSpeed scores (via API) and responsive-design signals based on CSS usage and viewport hints.
 - **Accessibility**: Alt-text coverage, logo and body image tagging, heading structure, ARIA usage, and heuristics for clickable non-link elements.
 - **Trust signals**: Security headers, cookie/consent choice likelihood, and discovery of `.well-known/security.txt` and `llms.txt`.
+
+## Attribution & License
+
+If you use or adapt this project, please attribute it as follows:
+
+```
+KMU Webcheck by Marco Aures  
+Source: https://marcoaures.ch
+Licensed under CC BY-NC 4.0 – https://creativecommons.org/licenses/by-nc/4.0/
+```
 
 ## Project structure
 ```
@@ -54,11 +64,16 @@ dns_tools/dns_security.py   # SPF, DMARC, and DNSSEC checks
    Beispiel AG;Bern;Töpferei;https://beispiel.ch
    ```
 3. Update `OUTPUT_CSV` in `config/config.py` to control where the results are written (default `_output/output.csv`).
-4. (Optional) Adjust `WORKER_COUNT`, progress logging flags, API toggles (`DEBUG_API`, `SKIPPING_APIS`, `WHATCMS_PRIVATE`), or the checkpointing frequency (`CHECKPOINT_INTERVAL`) in `config/config.py` if needed.
+4. (Optional) Adjust `WORKER_COUNT`, progress logging flags, API toggles (`DEBUG_API`, `SKIPPING_APIS`, `WHATCMS_PRIVATE`), the checkpointing frequency (`CHECKPOINT_INTERVAL`), or batch controls (`DOMAIN_OFFSET`, `DOMAINS_PER_RUN`) in `config/config.py` if needed.
 5. Run the scanner:
    ```bash
    python main.py
    ```
+
+Batch controls:
+- `DOMAIN_OFFSET` lets you skip a fixed number of initial CSV rows (useful to resume interrupted runs).
+- `DOMAINS_PER_RUN` caps how many domains are processed in one execution (leave unset or `<=0` to process all rows).
+Both can be set via environment variables or directly in `config/config.py`.
 
 ## Output
 The generated CSV includes the domain and numerous columns spanning availability, SEO/content sections, language, accessibility, performance, security, compliance, and trust signals. See the `fieldnames` list in `main.py` for the definitive set of columns.

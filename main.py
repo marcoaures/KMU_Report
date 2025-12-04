@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config.config import (
     INPUT_CSV,
     OUTPUT_CSV,
+    DOMAIN_OFFSET,
+    DOMAINS_PER_RUN,
     WORKER_COUNT,
     MAX_CSS_FILES_FOR_RESPONSIVE_CHECK,
     MAX_CSS_BYTES_FOR_RESPONSIVE_CHECK,
@@ -616,6 +618,20 @@ def load_domains_from_csv(csv_path: str) -> List[str]:
 def main() -> None:
     setup_logging()
     domains = load_domains_from_csv(INPUT_CSV)
+    if DOMAIN_OFFSET > 0:
+        domains = domains[DOMAIN_OFFSET:]
+
+    if DOMAINS_PER_RUN is not None:
+        domains = domains[:DOMAINS_PER_RUN]
+
+    if DOMAIN_OFFSET > 0 or DOMAINS_PER_RUN is not None:
+        logging.info(
+            "Domain window applied (offset=%s, limit=%s). Remaining: %s",
+            DOMAIN_OFFSET,
+            DOMAINS_PER_RUN if DOMAINS_PER_RUN is not None else "none",
+            len(domains),
+        )
+
     if not domains:
         print(f"No domains found in {INPUT_CSV}")
         return

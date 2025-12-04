@@ -1,0 +1,4 @@
+KMU Webcheck 2.1
+----------------
+- Added configurable DOMAIN_OFFSET and DOMAINS_PER_RUN settings to control batch sizes per run.
+- Use the new config values to start from a specific position in the input CSV and cap the number of domains processed.
