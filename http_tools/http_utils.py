@@ -1,104 +1,85 @@
-"""HTTP helpers with safe defaults for reachability checks and downloads."""
-
+"""Reachability, HTTPS enforcement and HSTS helpers."""
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+import re
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 
-from config.config import HEADERS, REQUEST_TIMEOUT, USER_AGENT
+from http_tools.client import DomainClient, registrable_domain
 
 
+def is_html(resp: Optional[requests.Response]) -> bool:
+    """True if the response carries an HTML document."""
+    if resp is None:
+        return False
+    ctype = resp.headers.get("Content-Type", "").lower()
+    return "html" in ctype
 
-def safe_get(
-    url: str,
-    allow_redirects: bool = True,
-    return_reason: bool = False,
-    robots_txt: Optional[str] = None,
-    user_agent: str = USER_AGENT,
-    log_disallowed: bool = False,
-):
-    """HTTP GET with common headers, timeout and error handling.
 
-    If ``return_reason`` is True, return a tuple of (response, error_reason) where
-    ``error_reason`` is a short string describing why the request failed.
+def check_website_reachable(domain: str, client: DomainClient) -> Dict[str, Any]:
+    """Try HTTPS first, then HTTP.
+
+    Returns a dict with:
+        reachable   True only for a final status below 400
+        status      "ok", "http_<code>", "blocked_http_403/429" or an error label
+        response    the homepage response (only if reachable)
+        base_url    scheme://host of the final URL (only if reachable)
+        final_domain / other_domain   where redirects ended up
     """
-    if robots_txt is not None:
-        from analysis.sitemap_utils import robots_allows_url
-
-        if not robots_allows_url(robots_txt, url, user_agent=user_agent):
-            if log_disallowed:
-                print(f"[safe_get] disallowed_by_robots: {url}")
-            return (None, "disallowed_by_robots") if return_reason else None
-
-    try:
-        resp = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=allow_redirects,
-        )
-        if return_reason:
-            return resp, None
-        return resp
-    except requests.Timeout:
-        return (None, "timeout") if return_reason else None
-    except requests.ConnectionError:
-        return (None, "connection_error") if return_reason else None
-    except requests.RequestException as exc:
-        return (None, exc.__class__.__name__.lower()) if return_reason else None
-
-
-def check_website_reachable(
-    domain: str,
-    get_fn: Callable = safe_get,
-) -> Tuple[bool, Optional[str], Optional[requests.Response], str]:
-    """
-    Try to reach the website via HTTPS first, then HTTP.
-
-    Returns:
-        reachable (bool),
-        base_url (str | None),
-        base_response (requests.Response | None),
-        reachability_status (str)
-    """
-    https_url = f"https://{domain}/"
-    http_url = f"http://{domain}/"
-
-    last_error = "unreachable"
-
-    for url in (https_url, http_url):
-        resp, error = get_fn(url, return_reason=True)
-        if resp:
-            status = resp.status_code
-            if status < 400:
-                return True, url, resp, "ok"
-            return False, url, None, f"http_{status}"
+    out: Dict[str, Any] = {
+        "reachable": False, "status": "unreachable", "response": None,
+        "base_url": None, "final_domain": None, "other_domain": None,
+    }
+    for url in (f"https://{domain}/", f"http://{domain}/"):
+        resp, error = client.get(url, is_homepage=True, return_reason=True)
+        if resp is not None:
+            code = resp.status_code
+            final = urlparse(resp.url)
+            out["final_domain"] = final.netloc.lower()
+            out["other_domain"] = registrable_domain(final.netloc) != registrable_domain(domain)
+            if code < 400:
+                out.update(reachable=True, status="ok", response=resp,
+                           base_url=f"{final.scheme}://{final.netloc}")
+            elif code in (403, 429):
+                out["status"] = f"blocked_http_{code}"
+            else:
+                out["status"] = f"http_{code}"
+            return out
         if error:
-            last_error = error
+            out["status"] = error
+        if error in ("disallowed_by_robots", "budget_exhausted") or client.stop_reason:
+            break
+    return out
 
-    return False, None, None, last_error
 
+def check_https_enforced(
+    domain: str, client: DomainClient, base_url: Optional[str]
+) -> Optional[bool]:
+    """Is http://<domain>/ redirected to HTTPS?
 
-def check_https_enforced(domain: str, get_fn: Callable = safe_get) -> Optional[bool]:
+    True/False as measured, None if plain HTTP does not answer at all.
     """
-    Check if http://<domain> is redirected to https://...
-
-    Returns:
-        True  -> HTTP redirected to HTTPS
-        False -> HTTP reachable but not redirected to HTTPS
-        None  -> HTTP not reachable / cannot determine
-    """
-    http_url = f"http://{domain}/"
-    resp = get_fn(http_url, allow_redirects=True)
-    if not resp:
+    if base_url and base_url.startswith("http://"):
+        return False  # the site itself is served over plain HTTP
+    # Only headers matter here, so download next to nothing.
+    resp = client.get(f"http://{domain}/", max_bytes=2048)
+    if resp is None:
         return None
-    final_url = resp.url.lower()
-    return final_url.startswith("https://")
+    return resp.url.lower().startswith("https://")
 
 
-def check_hsts(resp_https: Optional[requests.Response]) -> str:
-    """Return the Strict-Transport-Security header value if present, else empty string."""
-    if not resp_https:
-        return ""
-    return resp_https.headers.get("Strict-Transport-Security", "")
+def parse_hsts(resp: Optional[requests.Response]) -> Dict[str, Any]:
+    """Split the Strict-Transport-Security header into its parts."""
+    out: Dict[str, Any] = {"hsts_header": None, "hsts_max_age": None,
+                           "hsts_include_subdomains": None}
+    if resp is None or not resp.url.lower().startswith("https://"):
+        return out
+    value = resp.headers.get("Strict-Transport-Security", "")
+    out["hsts_header"] = value
+    if value:
+        m = re.search(r"max-age\s*=\s*\"?(\d+)", value, re.I)
+        out["hsts_max_age"] = int(m.group(1)) if m else None
+        out["hsts_include_subdomains"] = "includesubdomains" in value.lower()
+    return out

@@ -1,3 +1,34 @@
+KMU Webcheck 3.0
+----------------
+Big clean-up. The output columns changed, so 2.x result files cannot be resumed.
+
+Measuring
+- Empty now means "not measured"; False means "checked and not there".
+- Fixed: ARIA detection (was always False), HTTP error codes (were reported as
+  "unreachable"), address detection (years counted as postal codes), Google
+  Analytics false positives (g-recaptcha), social links (wix.com counted as X),
+  TLS error categories, primary language, careers slugs, cookie button labels,
+  heading check, PageSpeed rounding.
+- Responsive check understands min-width, range syntax and container queries.
+- Alt texts: missing attribute and empty alt="" are counted separately.
+- New: local CMS detection, MX check, placeholder/parked pages, redirect target,
+  HSTS details, third parties seen by Lighthouse, more analytics tools.
+
+Crawling
+- One shared HTTP client: connection reuse, request budget per domain,
+  throttling per server IP, robots.txt incl. Crawl-delay, download caps,
+  stop on 403/429, emergency brake, request log.
+- About 12 instead of about 190 guessed URLs in the worst case.
+- Sitemaps: depth/file/URL limits, no more endless recursion.
+
+Running
+- Resume by default: finished domains are skipped, new rows are appended,
+  failed domains get a row and are retried next time.
+- Input: UTF-8 or Windows-1252, ";" or ",", flexible column name, IDN domains.
+- Opt-out list, platform links (Facebook, Wix subdomains, ...) are skipped.
+- Output: ";" and UTF-8 with BOM by default (opens in Excel).
+- Tests (pytest), requirements.txt, MIT license.
+
 KMU Webcheck 2.1
 ----------------
 - Added configurable DOMAIN_OFFSET and DOMAINS_PER_RUN settings to control batch sizes per run.

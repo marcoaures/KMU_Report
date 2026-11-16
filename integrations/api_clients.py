@@ -1,328 +1,260 @@
-# api_clients.py
+"""PageSpeed Insights and WhatCMS clients with shared rate limiting."""
 from __future__ import annotations
 
-from typing import Optional, Dict
-
+import logging
 import random
+import threading
 import time
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
-from config.dictionary_config import SOCIAL_DOMAINS
-from config.config import (
-    DEBUG_API,
-    PAGESPEED_API_KEY,
-    REQUEST_TIMEOUT,
-    SKIPPING_APIS,
-    WHATCMS_API_KEY,
-    WHATCMS_PRIVATE,
-)
+from config import config as cfg
+from http_tools.client import registrable_domain
+
+log = logging.getLogger(__name__)
 
 
-def _mask_api_key(full_url: str) -> str:
-    """Return a URL string with the ``key`` query parameter redacted."""
-    try:
-        parsed = urlparse(full_url)
-        masked_query = urlencode(
-            [(k, "***" if k == "key" else v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)]
-        )
-        return urlunparse(parsed._replace(query=masked_query))
-    except Exception:
-        return full_url
+class RateLimiter:
+    """At most one call per interval, across all worker threads."""
+
+    def __init__(self, interval_name: str) -> None:
+        self._interval_name = interval_name
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self) -> None:
+        interval = float(getattr(cfg, self._interval_name))
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + interval
+        if start > now:
+            time.sleep(start - now)
 
 
-def _sleep_with_backoff(attempt: int, base_delay: int = 1, max_delay: int = 30) -> None:
+_pagespeed_limiter = RateLimiter("PAGESPEED_MIN_INTERVAL")
+_whatcms_limiter = RateLimiter("WHATCMS_MIN_INTERVAL")
+# Set once WhatCMS says the key is invalid or the quota is used up: no point
+# in asking again during this run.
+_whatcms_disabled = threading.Event()
+_whatcms_disabled_reason = ""
+
+
+def _debug(*args) -> None:
+    if cfg.DEBUG_API:
+        print(*args)
+
+
+def _backoff(attempt: int, retry_after: Optional[str] = None, max_delay: float = 60.0) -> None:
+    """Sleep before the next attempt: Retry-After if given, else jittered exponential."""
+    delay = None
+    if retry_after:
+        try:
+            delay = min(float(retry_after), max_delay)
+        except ValueError:
+            delay = None
+    if delay is None:
+        delay = random.uniform(1.0, min(max_delay, 2.0 ** attempt))
+    time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# PageSpeed Insights
+# ---------------------------------------------------------------------------
+
+PSI_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+# Lighthouse 13 calls the audit "third-parties-insight"; older versions "third-party-summary".
+THIRD_PARTY_AUDITS = ("third-parties-insight", "third-party-summary")
+
+
+def _collect_entities(node: Any, found: List[str]) -> None:
+    """Pull every "entity" name out of an audit's details, whatever their nesting."""
+    if isinstance(node, dict):
+        entity = node.get("entity")
+        if isinstance(entity, dict):
+            entity = entity.get("text")
+        if isinstance(entity, str) and entity.strip():
+            found.append(entity.strip())
+        for value in node.values():
+            _collect_entities(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_entities(value, found)
+
+
+def extract_third_parties(data: dict, page_url: str) -> Optional[List[str]]:
+    """Names of third parties Lighthouse saw while loading the page, or None
+    if the response does not contain the audit."""
+    audits = (data.get("lighthouseResult") or {}).get("audits") or {}
+    audit = next((audits[a] for a in THIRD_PARTY_AUDITS if a in audits), None)
+    if audit is None:
+        return None
+    found: List[str] = []
+    _collect_entities(audit.get("details"), found)
+    own = registrable_domain(urlparse(page_url).netloc)
+    return sorted({name for name in found if registrable_domain(name) != own and name.lower() != own})
+
+
+def fetch_pagespeed(url: str, strategy: str = "mobile", third_parties: bool = False) -> Dict[str, Any]:
+    """Lighthouse performance score (0-100) for ``strategy``.
+
+    Returns {"score", "status", "third_parties"}. status is "ok", "skipped",
+    "no_score", "rate_limited", "timeout", "http_<code>" or "error".
     """
-    Sleep for a jittered exponential backoff interval.
+    out: Dict[str, Any] = {"score": None, "status": "skipped", "third_parties": None}
+    if cfg.SKIPPING_APIS or not cfg.PAGESPEED_API_KEY:
+        return out
 
-    Args:
-        attempt: 1-based attempt count.
-        base_delay: Initial delay in seconds.
-        max_delay: Maximum delay in seconds.
-    """
+    fields = ["lighthouseResult/categories/performance/score"]
+    if third_parties:
+        fields += [f"lighthouseResult/audits/{a}/details" for a in THIRD_PARTY_AUDITS]
+    params = {"url": url, "key": cfg.PAGESPEED_API_KEY, "strategy": strategy,
+              "category": "performance", "fields": ",".join(fields)}
 
-    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-    jittered_delay = random.uniform(0, delay)
-    time.sleep(jittered_delay)
-
-
-def _log_whatcms_results(techs: list[dict]) -> None:
-    """Emit a compact summary of WhatCMS technologies when DEBUG_API is True."""
-
-    if not DEBUG_API:
-        return
-
-    print(f"[WhatCMS Parsed] results={len(techs)}")
-    for tech in techs[:5]:
-        name = tech.get("name")
-        version = tech.get("version")
-        categories = tech.get("categories") or []
-        print(f"  - {name!r} version={version!r} categories={categories}")
-
-
-def _normalize_social_network(network: str) -> Optional[str]:
-    mapping = {
-        "twitter": "Twitter",
-        "x": "X",
-        "instagram": "Instagram",
-        "facebook": "Facebook",
-        "linkedin": "LinkedIn",
-        "youtube": "YouTube",
-        "tiktok": "TikTok",
-    }
-
-    normalized = mapping.get(network.lower()) if network else None
-    return normalized
-
-
-def _extract_social_from_whatcms(meta: dict) -> list[str]:
-    """Map WhatCMS social entries to our normalized labels."""
-
-    social_entries = meta.get("social", []) if isinstance(meta, dict) else []
-    if not isinstance(social_entries, list):
-        return []
-
-    found: set[str] = set()
-    for entry in social_entries:
-        if not isinstance(entry, dict):
+    for attempt in range(1, cfg.API_MAX_ATTEMPTS + 1):
+        last = attempt == cfg.API_MAX_ATTEMPTS
+        _pagespeed_limiter.wait()
+        try:
+            resp = requests.get(PSI_URL, params=params, timeout=cfg.PAGESPEED_TIMEOUT)
+        except requests.Timeout:
+            out["status"] = "timeout"
+            if not last:
+                _backoff(attempt)
+            continue
+        except requests.RequestException:
+            out["status"] = "error"
+            if not last:
+                _backoff(attempt)
             continue
 
-        network = entry.get("network") or ""
-        url = entry.get("url") or ""
+        _debug("[PageSpeed]", strategy, url, "->", resp.status_code)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                out["status"] = "error"
+                return out
+            score = ((data.get("lighthouseResult") or {}).get("categories") or {}) \
+                .get("performance", {}).get("score")
+            out["score"] = round(score * 100) if score is not None else None
+            out["status"] = "ok" if score is not None else "no_score"
+            if third_parties:
+                out["third_parties"] = extract_third_parties(data, url)
+            return out
+        if resp.status_code == 400 and "fields" in params and third_parties:
+            # the field filter was not accepted: ask again for the full response
+            params.pop("fields")
+            continue
+        if resp.status_code == 429 or resp.status_code >= 500:
+            out["status"] = "rate_limited" if resp.status_code == 429 else f"http_{resp.status_code}"
+            if not last:
+                _backoff(attempt, resp.headers.get("Retry-After"))
+            continue
+        out["status"] = f"http_{resp.status_code}"
+        return out
+    return out
 
-        name = _normalize_social_network(network)
 
-        if not name and url:
-            u = url.lower()
-            for key, display in SOCIAL_DOMAINS.items():
-                if key in u:
-                    name = display
-                    break
+# ---------------------------------------------------------------------------
+# WhatCMS
+# ---------------------------------------------------------------------------
 
+WHATCMS_URL = "https://whatcms.org/API/Tech"
+_SOCIAL_NAMES = {"twitter": "X", "x": "X", "instagram": "Instagram", "facebook": "Facebook",
+                 "linkedin": "LinkedIn", "youtube": "YouTube", "tiktok": "TikTok"}
+
+
+def _whatcms_social(meta: Any) -> List[str]:
+    from analysis.html_analysis import social_network_for_url
+
+    entries = meta.get("social", []) if isinstance(meta, dict) else []
+    found = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = _SOCIAL_NAMES.get((entry.get("network") or "").lower()) \
+            or social_network_for_url(entry.get("url") or "")
         if name:
             found.add(name)
-
     return sorted(found)
 
 
-def whatcms_social(meta: dict) -> list[str]:
+def detect_cms_whatcms(domain: str) -> Dict[str, Any]:
+    """Ask WhatCMS which CMS a site runs.
+
+    Returns {"cms_name", "cms_version", "whatcms_status", "whatcms_social_profiles"}.
+    whatcms_status: "success", "skipped", "rate_limited", "quota_exceeded",
+    "invalid_key", "timeout", "invalid_json", "api_error_<code>" or "error".
+    cms_name is "" when WhatCMS answered but found no CMS, None when it did not answer.
     """
-    Return normalized social profile names from WhatCMS metadata and log debug details.
+    global _whatcms_disabled_reason
+    out: Dict[str, Any] = {"cms_name": None, "cms_version": None,
+                           "whatcms_status": "skipped", "whatcms_social_profiles": []}
+    if cfg.SKIPPING_APIS or not cfg.WHATCMS_API_KEY or cfg.WHATCMS_MODE == "off":
+        return out
+    if _whatcms_disabled.is_set():
+        out["whatcms_status"] = _whatcms_disabled_reason
+        return out
 
-    In DEBUG_API mode, this prints both the raw social array returned by WhatCMS and the
-    normalized labels derived from it so users can verify the extraction behavior.
-    """
-
-    raw_social = meta.get("social", []) if isinstance(meta, dict) else []
-    normalized = _extract_social_from_whatcms(meta)
-
-    if DEBUG_API:
-        print("[WhatCMS Social] raw entries:", raw_social)
-        print("[WhatCMS Social] normalized:", normalized)
-
-    return normalized
-
-
-def fetch_pagespeed(url: str, strategy: str = "desktop") -> Optional[int]:
-    """
-    Fetch Lighthouse performance score from Google PageSpeed Insights
-    for a given strategy ("desktop" or "mobile").
-
-    Returns:
-        0–100 (int) or None on error / if APIs are skipped.
-    """
-    if SKIPPING_APIS or not PAGESPEED_API_KEY:
-        return None
-
-    api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    params = {
-        "url": url,
-        "key": PAGESPEED_API_KEY,
-        "strategy": strategy,
-        "category": "performance",
-        # only request what we actually need
-        "fields": "id,lighthouseResult/categories/performance/score",
-    }
-
-    for attempt in range(1, 4):
-        try:
-            resp = requests.get(api_url, params=params, timeout=60)
-
-            if DEBUG_API:
-                print("\n[PageSpeed Request]")
-                print("Attempt:", attempt)
-                print("Strategy:", strategy)
-                print("URL:", _mask_api_key(resp.url))
-                print("Status:", resp.status_code)
-
-            if resp.status_code != 200:
-                if DEBUG_API:
-                    try:
-                        print("Error JSON:", resp.json())
-                    except Exception:
-                        print("Error text:", resp.text[:500])
-                return None
-
-            data = resp.json()
-            lr = data.get("lighthouseResult", {})
-            categories = lr.get("categories", {})
-            perf_score = categories.get("performance", {}).get("score")
-            perf_score = int(perf_score * 100) if perf_score is not None else None
-
-            if DEBUG_API:
-                print("[PageSpeed Parsed]", strategy, "performance score:", perf_score)
-
-            return perf_score
-
-        except requests.exceptions.ReadTimeout as e:
-            if DEBUG_API:
-                print("[PageSpeed ReadTimeout]", strategy, "attempt", attempt, ":", e)
-
-            if attempt < 3:
-                _sleep_with_backoff(attempt)
-            continue
-        except Exception as e:
-            if DEBUG_API:
-                print("[PageSpeed Error]", strategy, ":", str(e))
-            return None
-
-    return None
-
-
-def detect_cms_and_server(domain: str) -> Dict[str, Optional[str]]:
-    """
-    Robust WhatCMS detection with:
-      - retries (3)
-      - explicit error signaling
-      - NO new CSV fields
-      - encode failures via cms_name="error_*"
-
-    Verbose mode (`DEBUG_API=True`) now mirrors the PageSpeed helper by printing
-    each request URL (with key masked), attempt number, HTTP status, API result
-    code/message, and a compact summary of detected technologies.
-    """
-    if SKIPPING_APIS or not WHATCMS_API_KEY:
-        return {
-            "cms_name": "skipped",
-            "cms_version": None,
-            "cms_version_up_to_date": None,
-            "whatcms_status": "skipped",
-            "whatcms_social_profiles": [],
-        }
-
-    api_url = "https://whatcms.org/API/Tech"
-    params = {
-        "key": WHATCMS_API_KEY,
-        "url": f"https://{domain}",
-    }
-
-    if WHATCMS_PRIVATE:
+    params = {"key": cfg.WHATCMS_API_KEY, "url": f"https://{domain}"}
+    if cfg.WHATCMS_PRIVATE:
         params["private"] = "true"
 
-    for attempt in range(1, 4):
+    for attempt in range(1, cfg.API_MAX_ATTEMPTS + 1):
+        last = attempt == cfg.API_MAX_ATTEMPTS
+        _whatcms_limiter.wait()
         try:
-            resp = requests.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(WHATCMS_URL, params=params, timeout=30)
+        except requests.Timeout:
+            out["whatcms_status"] = "timeout"
+            if not last:
+                _backoff(attempt)
+            continue
+        except requests.RequestException:
+            out["whatcms_status"] = "error"
+            if not last:
+                _backoff(attempt)
+            continue
 
-            if DEBUG_API:
-                print("\n[WhatCMS Request]")
-                print("Attempt:", attempt)
-                print("URL:", _mask_api_key(resp.url))
-                print("Status:", resp.status_code)
+        try:
+            data = resp.json()
+        except ValueError:
+            out["whatcms_status"] = "invalid_json"
+            return out
+        result = data.get("result", {}) if isinstance(data, dict) else {}
+        code = result.get("code") if isinstance(result, dict) else None
+        _debug("[WhatCMS]", domain, "-> code", code, result.get("msg") if isinstance(result, dict) else "")
 
-            try:
-                data = resp.json()
-            except Exception as e:
-                if DEBUG_API:
-                    print(f"[WhatCMS] Failed to parse JSON: {e}")
-                    print("Body:", resp.text[:500])
-                return {
-                    "cms_name": "api_error_invalid_json",
-                    "cms_version": None,
-                    "cms_version_up_to_date": None,
-                    "whatcms_status": "api_error_invalid_json",
-                    "whatcms_social_profiles": [],
-                }
+        if code == 120:  # too many requests: wait as told, then try again
+            out["whatcms_status"] = "rate_limited"
+            if not last:
+                _backoff(attempt, str(result.get("retry_in_seconds") or ""), max_delay=120)
+            continue
+        if code in (100, 101, 102, 121, 123):  # key problems or quota used up
+            reason = "quota_exceeded" if code == 121 else "invalid_key"
+            _whatcms_disabled_reason = reason
+            _whatcms_disabled.set()
+            log.warning("WhatCMS disabled for the rest of this run: %s (code %s)", reason, code)
+            out["whatcms_status"] = reason
+            return out
+        if code == 201:  # answered, nothing found
+            out.update(cms_name="", whatcms_status="success")
+            return out
+        if code != 200:
+            out["whatcms_status"] = f"api_error_{code}"
+            return out
 
-            result = data.get("result", {}) if isinstance(data, dict) else {}
-            code = result.get("code") if isinstance(result, dict) else None
-            msg = result.get("msg") if isinstance(result, dict) else None
-
-            if DEBUG_API:
-                print(f"[WhatCMS] API result code={code} msg={msg!r}")
-
-            # API returned an error code
-            if code != 200:
-                if DEBUG_API:
-                    print(f"[WhatCMS] API error code {code}: {msg}")
-                return {
-                    "cms_name": f"api_error_{code}",
-                    "cms_version": None,
-                    "cms_version_up_to_date": None,
-                    "whatcms_status": f"api_error_{code}",
-                    "whatcms_social_profiles": [],
-                }
-
-            techs = data.get("results", []) if isinstance(data, dict) else []
-            if not isinstance(techs, list):
-                techs = []
-
-            _log_whatcms_results(techs)
-
-            cms_name = None
-            cms_version = None
-            meta = data.get("meta", {}) if isinstance(data, dict) else {}
-            social_profiles = whatcms_social(meta)
-
-            for tech in techs:
-                cats = tech.get("categories") or []
-                if "CMS" in cats or "Blog" in cats:
-                    cms_name = tech.get("name")
-                    cms_version = tech.get("version")
-                    break
-
-            # No CMS detected (actual result)
-            if cms_name is None:
-                if DEBUG_API:
-                    print("[WhatCMS Parsed] No CMS detected")
-                return {
-                    "cms_name": "none",
-                    "cms_version": None,
-                    "cms_version_up_to_date": None,
-                    "whatcms_status": "success",
-                    "whatcms_social_profiles": social_profiles,
-                }
-
-            # Success
-            if DEBUG_API:
-                print(f"[WhatCMS Parsed] cms={cms_name!r} version={cms_version!r}")
-            return {
-                "cms_name": cms_name,
-                "cms_version": cms_version,
-                "cms_version_up_to_date": None,
-                "whatcms_status": "success",
-                "whatcms_social_profiles": social_profiles,
-            }
-
-        except requests.exceptions.Timeout:
-            if DEBUG_API:
-                print(f"[WhatCMS] Timeout attempt {attempt} for {domain}")
-
-            if attempt < 3:
-                _sleep_with_backoff(attempt)
-
-        except Exception as e:
-            if DEBUG_API:
-                print(f"[WhatCMS] Error attempt {attempt} for {domain}: {e}")
-
-            if attempt < 3:
-                _sleep_with_backoff(attempt)
-
-    # After all retries
-    return {
-        "cms_name": "error_timeout",
-        "cms_version": None,
-        "cms_version_up_to_date": None,
-        "whatcms_status": "error_timeout",
-        "whatcms_social_profiles": [],
-    }
+        techs = data.get("results", [])
+        out["whatcms_status"] = "success"
+        out["cms_name"] = ""
+        out["whatcms_social_profiles"] = _whatcms_social(data.get("meta", {}))
+        for tech in techs if isinstance(techs, list) else []:
+            cats = tech.get("categories") or []
+            if "CMS" in cats or "Blog" in cats:
+                out["cms_name"] = tech.get("name") or ""
+                out["cms_version"] = tech.get("version") or None
+                break
+        return out
+    return out

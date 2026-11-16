@@ -1,0 +1,15 @@
+# input lists and results contain company data: keep them out of the repo
+_input/
+_output/
+*.log
+
+# downloaded with tools/update_plz.py
+config/data/plz_ch.csv
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+.vscode/

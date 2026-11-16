@@ -577,7 +577,7 @@ SOCIAL_DOMAINS = {
     "facebook.com": "Facebook",
     "instagram.com": "Instagram",
     "x.com": "X",
-    "twitter.com": "Twitter",
+    "twitter.com": "X",
     "youtube.com": "YouTube",
     "tiktok.com": "TikTok",
 }
@@ -590,7 +590,6 @@ SOCIAL_DOMAINS = {
 TAG_MANAGER_PATTERNS = {
     # Google Tag Manager
     "googletagmanager.com/gtm.js": "GTM",
-    "googletagmanager.com/ns.html": "GTM",
 
     # Tealium iQ Tag Manager
     "tags.tiqcdn.com": "Tealium",
@@ -608,9 +607,8 @@ TAG_MANAGER_PATTERNS = {
     "piwik.pro": "Piwik PRO Tag Manager",
     "ppms.php": "Piwik PRO Tag Manager",
 
-    # Matomo Tag Manager
-    "matomo.js": "Matomo Tag Manager",
-    "matomoTagManager": "Matomo Tag Manager",
+    # Matomo Tag Manager (container files; plain matomo.js is analytics)
+    "/js/container_": "Matomo Tag Manager",
 }
 
 # ---------------------------------------------------------------------------
@@ -1040,15 +1038,34 @@ EMAIL_IGNORED_LOCALPARTS = [
     "bounce",
 ]
 
-# Swiss phone formats (international +41 xx xxx xx xx, national 0xx xxx xx xx)
+# Swiss phone formats. Separators may be spaces, dots, dashes or slashes;
+# the look-arounds keep us out of longer digit runs (IBANs, UIDs, ...).
 SWISS_PHONE_PATTERNS = [
-    re.compile(r"\+41\s?[1-9]\d\s?\d{3}\s?\d{2}\s?\d{2}"),
-    re.compile(r"0[1-9]\d\s?\d{3}\s?\d{2}\s?\d{2}"),
+    # international: +41 44 123 45 67, 0041 (0)44 123 45 67
+    re.compile(r"(?<![\d+])(?:\+|00)41[\s ]?(?:\(0\)[\s ]?)?[1-9]\d(?:[\s ./-]{0,2}\d){7}(?!\d)"),
+    # national: 044 123 45 67, 044/123'45'67
+    re.compile(r"(?<![\d.+])0[1-9]\d(?:[\s ./'-]{0,3}\d){7}(?![\d.])"),
 ]
 
-# ZIP + city (very simple heuristic)
+# Candidate "ZIP + place" in running text. Whether it really is an address is
+# decided in analysis/address.py (postal code list or stricter heuristic).
 ZIP_CITY_REGEX = re.compile(
-    r"\b(\d{4})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüéèàâêîôûçß\- ]{2,})"
+    r"(?<![\d.,'’])(?:CH[-– ]\s?)?([1-9]\d{3})[  ]+([A-ZÄÖÜÉÈÀ][^\d\n|•·,;]{1,40})"
+)
+
+# Words that make a four-digit number a year rather than a postal code.
+YEAR_CONTEXT_WORDS = [
+    "©", "(c)", "copyright", "seit", "since", "depuis", "dal", "anno", "gegründet",
+    "fondée", "fondé", "fondata", "founded", "jahr", "année", "anni",
+]
+
+# Street words (suffix or standalone) used when no postal code list is installed.
+STREET_REGEX = re.compile(
+    r"(?:\b[\wäöüéèà.\-]*(?:strasse|straße|str\.|weg|gasse|gässli|platz|allee|rain|ring|"
+    r"matte|halde|graben|quai|hof)\b|\b(?:rue|chemin|ch\.|avenue|av\.|route|rte|place|"
+    r"boulevard|bd|ruelle|impasse|via|viale|piazza|vicolo|corso|strada|postfach|"
+    r"case postale|casella postale)\b)[^\n]{0,40}",
+    re.IGNORECASE,
 )
 
 CONTACT_LINK_TEXTS = [
@@ -1100,3 +1117,138 @@ INTERACTIVE_CLASS_TOKENS = [
     "button",
     "cta",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Analytics tools: substring -> label. Checked against script URLs and against
+# inline script text (both lower-cased).
+# ---------------------------------------------------------------------------
+
+ANALYTICS_PATTERNS = {
+    "google-analytics.com/analytics.js": "Google Analytics",
+    "google-analytics.com/ga.js": "Google Analytics",
+    "connect.facebook.net": "Meta Pixel",
+    "fbevents.js": "Meta Pixel",
+    "fbq(": "Meta Pixel",
+    "snap.licdn.com": "LinkedIn Insight Tag",
+    "matomo.js": "Matomo",
+    "piwik.js": "Matomo",
+    "matomo.php": "Matomo",
+    "_paq.push": "Matomo",
+    "plausible.io/js": "Plausible",
+    "cdn.usefathom.com": "Fathom",
+    "static.hotjar.com": "Hotjar",
+    "hotjar.com/c/hotjar": "Hotjar",
+    "clarity.ms/tag": "Microsoft Clarity",
+    "bat.bing.com": "Microsoft Ads",
+    "static.cloudflareinsights.com": "Cloudflare Web Analytics",
+    "analytics.tiktok.com": "TikTok Pixel",
+    "s.pinimg.com/ct": "Pinterest Tag",
+    "googleadservices.com": "Google Ads",
+    "googlesyndication.com": "Google AdSense",
+    "doubleclick.net": "Google Ads",
+    "js.hs-scripts.com": "HubSpot",
+    "js.hs-analytics.net": "HubSpot",
+    "etracker.com": "etracker",
+    "etracker.de": "etracker",
+    "umami.is": "Umami",
+    "simpleanalyticscdn.com": "Simple Analytics",
+    "cdn.pirsch.io": "Pirsch",
+    "friendlyanalytics.ch": "Friendly Analytics",
+    "mouseflow.com": "Mouseflow",
+    "cdn.mxpnl.com": "Mixpanel",
+    "wp-statistics": "WP Statistics",
+    "stats.wp.com": "Jetpack Stats",
+    "koko-analytics": "Koko Analytics",
+    "burst-statistics": "Burst Statistics",
+    "independent-analytics": "Independent Analytics",
+}
+
+# ---------------------------------------------------------------------------
+# Social links: what does not count as a profile
+# ---------------------------------------------------------------------------
+
+SOCIAL_SHARE_PATH_TOKENS = [
+    "/sharer", "/share", "/intent/", "/sharearticle", "/dialog/", "/plugins/",
+    "/hashtag/", "/search", "/login", "/signup", "/home", "/policies", "/policy",
+    "/privacy", "/legal", "/help", "/about", "/watch", "/embed/", "/tr",
+    "/terms", "/tos", "/t/", "/results",
+]
+
+# ---------------------------------------------------------------------------
+# Careers: finer rules
+# ---------------------------------------------------------------------------
+
+# Everyday words that also mean "work": only trusted on a short homepage link
+# whose text matches as well, never in sitemap slugs.
+CAREER_AMBIGUOUS_KEYWORDS = {
+    "travail", "lavoro", "lavur", "lavurs", "opportunites", "opportunités",
+    "opportunita", "occurrenzas",
+}
+
+# "karriere-bei-uns" is a careers slug, "jobs-to-be-done" is not: after a
+# career keyword only these filler words may follow.
+CAREER_SLUG_FILLERS = {
+    "und", "et", "e", "and", "bei", "uns", "chez", "nous", "con", "noi", "at",
+    "with", "us", "im", "team", "portal", "angebote", "aktuell", "aktuelle",
+    "offene", "stellen", "jobs", "karriere", "career", "careers", "de", "fr",
+    "it", "en", "rm", "ch", "overview", "uebersicht", "übersicht",
+}
+
+# ---------------------------------------------------------------------------
+# Guessed section paths, by page language. Only a handful are ever requested
+# (see MAX_FALLBACK_PATHS_PER_SECTION); the long *_FALLBACK_PATHS lists above
+# are still used to recognise where a redirect ended up.
+# ---------------------------------------------------------------------------
+
+SECTION_TOP_PATHS = {
+    "imprint": {
+        "de": ["/impressum"], "fr": ["/mentions-legales"],
+        "it": ["/note-legali"], "en": ["/imprint", "/legal-notice"],
+    },
+    "privacy": {
+        "de": ["/datenschutz", "/datenschutzerklaerung"],
+        "fr": ["/protection-des-donnees", "/politique-de-confidentialite"],
+        "it": ["/privacy", "/protezione-dei-dati"],
+        "en": ["/privacy", "/privacy-policy"],
+    },
+    "terms": {
+        "de": ["/agb"], "fr": ["/cgv", "/conditions-generales"],
+        "it": ["/condizioni-generali", "/cg"], "en": ["/terms", "/terms-and-conditions"],
+    },
+    "careers": {
+        "de": ["/jobs", "/karriere"], "fr": ["/emplois", "/carriere"],
+        "it": ["/lavora-con-noi", "/carriera"], "en": ["/jobs", "/careers"],
+    },
+    "blog": {
+        "de": ["/blog", "/news", "/aktuelles"], "fr": ["/blog", "/actualites"],
+        "it": ["/blog", "/news"], "en": ["/blog", "/news"],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Placeholder pages (parked domains, "coming soon", server default pages)
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_PHRASES = {
+    "for_sale": [
+        "domain is for sale", "this domain is for sale", "buy this domain",
+        "domain steht zum verkauf", "diese domain kaufen", "domain kaufen",
+        "domain zu verkaufen", "ce domaine est à vendre", "dominio è in vendita",
+        "sedoparking", "parkingcrew", "domain parking", "this domain is parked",
+        "diese domain ist geparkt", "domain wurde registriert",
+        "this domain has been registered", "ce nom de domaine a été enregistré",
+    ],
+    "under_construction": [
+        "under construction", "coming soon", "hier entsteht", "in kürze",
+        "demnächst verfügbar", "website im aufbau", "seite im aufbau",
+        "wartungsmodus", "maintenance mode", "site en construction",
+        "en construction", "bientôt disponible", "sito in costruzione",
+        "in costruzione", "prossimamente",
+    ],
+    "default_page": [
+        "welcome to nginx", "apache2 ubuntu default page", "apache2 debian default page",
+        "it works!", "default web page", "default plesk page", "web server's default page",
+        "iis windows server", "test page for the apache", "index of /",
+    ],
+}

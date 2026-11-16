@@ -1,176 +1,114 @@
-"""DNS-related security checks for SPF, DMARC, DNSSEC and related helpers."""
+"""DNS checks: MX, SPF, DMARC and a DNSSEC heuristic."""
 from __future__ import annotations
 
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
-import dns.resolver
 import dns.exception
-import tldextract
+import dns.resolver
 
-from http_tools.http_utils import safe_get
+from http_tools.client import registrable_domain
 
-# Configure the shared resolver with short, predictable timeouts to keep
-# SPF/DMARC and DNSSEC checks responsive.
-dns.resolver.default_resolver = dns.resolver.Resolver(configure=True)
-dns.resolver.default_resolver.lifetime = 3.0   # overall timeout per query set
-dns.resolver.default_resolver.timeout = 2.0    # per nameserver attempt
+# Our own resolver with short timeouts; dnspython's global default stays untouched.
+resolver = dns.resolver.Resolver(configure=True)
+resolver.lifetime = 4.0   # overall time per query
+resolver.timeout = 2.0    # per nameserver attempt
 
-def base_domain_for_email(domain: str) -> str:
-    """
-    Use tldextract to derive the registrable base domain for SPF/DMARC checks.
-
-    Example:
-        www.example.co.uk -> example.co.uk
-    """
-    ext = tldextract.extract(domain)
-    if not ext.domain or not ext.suffix:
-        return domain
-    return f"{ext.domain}.{ext.suffix}"
+_NO_DATA = (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN)
 
 
-def base_domain_for_dnssec(domain: str) -> str:
-    """
-    Similar idea to base_domain_for_email. We want the zone apex:
-    example.ch from www.example.ch.
-    """
-    return base_domain_for_email(domain)
-
-def get_txt_records(name: str) -> List[str]:
-    """
-    Return DNS TXT records for a name as clean strings
-    (joined fragments, quotes stripped).
-    """
+def _query(name: str, rtype: str) -> Optional[list]:
+    """Records, [] if the name has none, None if the lookup itself failed."""
     try:
-        answers = dns.resolver.resolve(name, "TXT")
-        records: List[str] = []
-        for r in answers:
-            if hasattr(r, "strings") and r.strings:
-                s = "".join(
-                    part.decode() if isinstance(part, bytes) else part
-                    for part in r.strings
-                )
-            else:
-                s = str(r)
-            records.append(s.strip('"'))
-        return records
-    except dns.exception.DNSException:
-        return []
-
-
-def get_ds_records(name: str) -> list:
-    try:
-        answers = dns.resolver.resolve(name, "DS")
-        return [r for r in answers]
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        return list(resolver.resolve(name, rtype))
+    except _NO_DATA:
         return []
     except dns.exception.DNSException:
-        # Escalate network or resolver failures so callers can classify them.
-        raise
+        return None
 
 
-def get_dnskey_records(name: str) -> list:
-    try:
-        answers = dns.resolver.resolve(name, "DNSKEY")
-        return [r for r in answers]
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-        return []
-    except dns.exception.DNSException:
-        # Escalate network or resolver failures so callers can classify them.
-        raise
-
-
-# High-level DNS security checks
-
-def check_dnssec(domain: str) -> str:
-    """
-    Heuristic DNSSEC status:
-
-        - not-enabled                     → no DS and no DNSKEY
-        - enabled (DS & DNSKEY)           → DS in parent + DNSKEY at zone
-        - misconfigured (DS but no DNSKEY)→ DS but DNSKEY missing / failing
-        - indeterminate (lookup error)    → DNS queries failed in a generic way
-    """
-    base = base_domain_for_dnssec(domain)
-
-    try:
-        ds_records = get_ds_records(base)
-    except dns.exception.DNSException:
-        return "indeterminate (DS lookup error)"
-
-    # No DS: the parent zone does not delegate a signed child.
-    if not ds_records:
-        # Optional: if you still want to distinguish "DNSKEY only", check here
-        try:
-            dnskeys = get_dnskey_records(base)
-        except dns.exception.DNSException:
-            # Without DS we already know the zone is effectively unsigned.
-            return "not-enabled"
-
-        if dnskeys:
-            # Publishing DNSKEY without DS leaves the chain of trust incomplete.
-            return "not-enabled"
+def get_txt_records(name: str) -> Optional[List[str]]:
+    answers = _query(name, "TXT")
+    if answers is None:
+        return None
+    records = []
+    for r in answers:
+        parts = getattr(r, "strings", None)
+        if parts:
+            records.append("".join(p.decode("utf-8", "replace") if isinstance(p, bytes) else p
+                                   for p in parts))
         else:
-            return "not-enabled"
-
-    # DS exists → the zone should publish DNSKEY material
-    try:
-        dnskeys = get_dnskey_records(base)
-    except dns.exception.DNSException:
-        return "misconfigured (DS but DNSKEY query failed)"
-
-    if not dnskeys:
-        return "misconfigured (DS but no DNSKEY)"
-
-    # Basic sanity: expect at least one key with a plausible algorithm/flags.
-    sane_dnskey_present = False
-    for r in dnskeys:
-        try:
-            # dnspython DNSKEY fields: flags, protocol, algorithm
-            if r.protocol != 3:
-                continue
-            if r.algorithm == 0:
-                continue
-            # typical flags: 256 (ZSK), 257 (KSK)
-            if r.flags in (256, 257):
-                sane_dnskey_present = True
-                break
-        except Exception:
-            continue
-
-    if not sane_dnskey_present:
-        return "misconfigured (DNSKEYs look invalid)"
-
-    return "enabled (DS & DNSKEY)"
+            records.append(str(r).strip('"'))
+    return records
 
 
-def check_spf(domain: str) -> Tuple[bool, str]:
-    """Check for presence of an SPF TXT record on the base domain."""
-    base = base_domain_for_email(domain)
-    txts = get_txt_records(base)
+def check_mx(domain: str) -> Optional[bool]:
+    """Does the registrable domain accept mail? A "null MX" (RFC 7505) counts as no."""
+    answers = _query(registrable_domain(domain), "MX")
+    if answers is None:
+        return None
+    return any(str(r.exchange).rstrip(".") for r in answers)
+
+
+def check_spf(domain: str) -> Tuple[Optional[bool], str]:
+    """(present, record) for the registrable domain; present is None on lookup errors."""
+    txts = get_txt_records(registrable_domain(domain))
+    if txts is None:
+        return None, ""
     for txt in txts:
         if txt.lower().startswith("v=spf1"):
             return True, txt
     return False, ""
 
 
-def check_dmarc(domain: str) -> Optional[str]:
-    """
-    Check for a DMARC policy on the base domain and extract the policy (p=).
+def check_dmarc(domain: str) -> Tuple[Optional[bool], str]:
+    """(present, policy). Looks at the exact host first, then at the
+    registrable domain, as receivers do."""
+    names = [f"_dmarc.{domain}"]
+    base = f"_dmarc.{registrable_domain(domain)}"
+    if base not in names:
+        names.append(base)
 
-    Returns:
-        policy string (e.g. "none", "quarantine", "reject") or None if not found.
+    failed = False
+    for name in names:
+        txts = get_txt_records(name)
+        if txts is None:
+            failed = True
+            continue
+        for txt in txts:
+            if txt.lower().startswith("v=dmarc1"):
+                policy = "unknown"
+                for part in txt.split(";"):
+                    part = part.strip()
+                    if part.lower().startswith("p="):
+                        policy = part.split("=", 1)[1].strip().lower()
+                        break
+                return True, policy
+    return (None, "") if failed else (False, "")
+
+
+def check_dnssec(domain: str) -> str:
+    """Heuristic DNSSEC status of the registrable domain.
+
+        enabled                           DS at the parent and DNSKEY in the zone
+        not_enabled                       neither
+        dnskey_without_ds                 keys published, chain of trust not closed
+        misconfigured_ds_without_dnskey   DS at the parent but no usable DNSKEY
+        indeterminate                     lookups failed
     """
-    base = base_domain_for_email(domain)
-    name = f"_dmarc.{base}"
-    txts = get_txt_records(name)
-    for txt in txts:
-        if txt.lower().startswith("v=dmarc1"):
-            policy = "unknown"
-            parts = txt.split(";")
-            for part in parts:
-                part = part.strip()
-                if part.lower().startswith("p="):
-                    policy = part.split("=", 1)[1].strip()
-                    break
-            return policy
-    return None
+    base = registrable_domain(domain)
+    ds = _query(base, "DS")
+    if ds is None:
+        return "indeterminate"
+    keys = _query(base, "DNSKEY")
+
+    if not ds:
+        return "dnskey_without_ds" if keys else "not_enabled"
+    if keys is None:
+        return "indeterminate"
+    sane = any(
+        getattr(k, "protocol", None) == 3
+        and getattr(k, "algorithm", 0) != 0
+        and int(getattr(k, "flags", 0)) in (256, 257)
+        for k in keys
+    )
+    return "enabled" if sane else "misconfigured_ds_without_dnskey"
